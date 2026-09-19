@@ -2,14 +2,13 @@ package ir.example.mychannel;
 
 import android.app.Activity;
 import android.app.AlertDialog;
-import android.os.Build;
-import android.os.Bundle;
+import android.content.SharedPreferences;
 import android.graphics.Color;
 import android.graphics.Typeface;
-import android.graphics.Insets;
+import android.os.Bundle;
+import android.text.InputType;
 import android.view.Gravity;
 import android.view.View;
-import android.view.WindowInsets;
 import android.webkit.WebResourceRequest;
 import android.webkit.WebView;
 import android.webkit.WebViewClient;
@@ -18,235 +17,246 @@ import android.widget.EditText;
 import android.widget.LinearLayout;
 import android.widget.ScrollView;
 import android.widget.TextView;
-import android.text.InputType;
-import org.json.JSONObject;
-import java.io.BufferedReader;
-import java.io.InputStream;
-import java.io.InputStreamReader;
-import java.io.OutputStream;
-import java.net.HttpURLConnection;
-import java.net.URL;
+import android.view.WindowManager;
+import android.net.Uri;
+
 import java.nio.charset.StandardCharsets;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
+import java.security.MessageDigest;
+import java.security.SecureRandom;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
+import javax.crypto.SecretKeyFactory;
+import javax.crypto.spec.PBEKeySpec;
 
 public class MainActivity extends Activity {
-    // Set this to your deployed HTTPS worker URL, without a trailing slash.
-    private static final String API = BuildConfig.API_BASE_URL;
-    private final ExecutorService io = Executors.newSingleThreadExecutor();
-    private final android.os.Handler handler = new android.os.Handler(android.os.Looper.getMainLooper());
-    private String sessionToken = ""; // Intentionally memory-only; relaunch requires the shared password.
-    private String channel = "";
+    private static final String PREFS = "channel_local_v2";
+    private static final String HASH = "password_hash";
+    private static final String SALT = "password_salt";
+    private static final String CHANNEL = "channel_username";
+    private static final int ROUNDS = 180000;
+    private static final Pattern USERNAME =
+        Pattern.compile("^(?:(?:https://)?(?:www\\.)?t\\.me/)?@?([A-Za-z0-9_]{5,32})/?$", Pattern.CASE_INSENSITIVE);
+    private final SecureRandom random = new SecureRandom();
+    private SharedPreferences prefs;
     private LinearLayout root;
     private WebView web;
-    private TextView notice;
-    private boolean checking = false;
-    private final Runnable periodicCheck = new Runnable() {
-        @Override public void run() {
-            if (!sessionToken.isEmpty()) checkSession(false);
-            handler.postDelayed(this, 120000); // Password rotations take effect on next check/resume.
-        }
-    };
+    private TextView feedback;
+    private boolean unlocked = false;
+    private int attempts = 0;
+    private long lockedUntil = 0;
 
     @Override public void onCreate(Bundle state) {
         super.onCreate(state);
+        prefs = getSharedPreferences(PREFS, MODE_PRIVATE);
         getWindow().setStatusBarColor(Color.WHITE);
         getWindow().setNavigationBarColor(Color.WHITE);
-        getWindow().getDecorView().setSystemUiVisibility(View.SYSTEM_UI_FLAG_LIGHT_STATUS_BAR | View.SYSTEM_UI_FLAG_LIGHT_NAVIGATION_BAR);
-        showLogin();
+        getWindow().getDecorView().setSystemUiVisibility(
+            View.SYSTEM_UI_FLAG_LIGHT_STATUS_BAR | View.SYSTEM_UI_FLAG_LIGHT_NAVIGATION_BAR);
+        // Avoid exposing screenshots containing the unlocked channel.
+        getWindow().addFlags(WindowManager.LayoutParams.FLAG_SECURE);
+        if (prefs.contains(HASH) && prefs.contains(SALT)) showLogin();
+        else showFirstSetup();
     }
-    @Override protected void onResume() {
-        super.onResume();
-        handler.removeCallbacks(periodicCheck);
-        handler.postDelayed(periodicCheck, 120000);
-        if (!sessionToken.isEmpty()) checkSession(false);
-        if (web != null) web.onResume();
+
+    private int dp(int n) { return (int)(n * getResources().getDisplayMetrics().density + 0.5f); }
+    private TextView text(String value, int size) {
+        TextView t = new TextView(this);
+        t.setText(value); t.setTextSize(size); t.setTextColor(Color.rgb(29, 42, 54));
+        t.setGravity(Gravity.CENTER); t.setPadding(dp(6), dp(12), dp(6), dp(12));
+        return t;
     }
-    @Override protected void onPause() {
-        handler.removeCallbacks(periodicCheck);
-        if (web != null) web.onPause();
-        super.onPause();
+    private Button button(String label) {
+        Button b = new Button(this); b.setText(label); b.setAllCaps(false);
+        LinearLayout.LayoutParams p = new LinearLayout.LayoutParams(-1, dp(52));
+        p.topMargin = dp(9); b.setLayoutParams(p); return b;
     }
-    @Override protected void onDestroy() {
-        handler.removeCallbacks(periodicCheck);
-        if (web != null) { web.stopLoading(); web.destroy(); web = null; }
-        io.shutdownNow();
-        super.onDestroy();
-    }
-    private int dp(int value) { return (int)(getResources().getDisplayMetrics().density * value + .5f); }
-    private TextView label(String text, int size) {
-        TextView v = new TextView(this); v.setText(text); v.setTextSize(size); v.setTextColor(Color.rgb(29, 42, 54));
-        v.setGravity(Gravity.CENTER); v.setPadding(dp(8), dp(12), dp(8), dp(12)); return v;
-    }
-    private Button button(String text) {
-        Button v = new Button(this); v.setText(text); v.setAllCaps(false);
-        LinearLayout.LayoutParams p = new LinearLayout.LayoutParams(-1, dp(52)); p.topMargin = dp(10); v.setLayoutParams(p); return v;
-    }
-    private EditText field(String hint, boolean password) {
+    private EditText input(String hint, boolean secret) {
         EditText e = new EditText(this); e.setHint(hint); e.setSingleLine(true);
         e.setTextDirection(View.TEXT_DIRECTION_LTR);
-        e.setInputType(password ? InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_PASSWORD : InputType.TYPE_CLASS_TEXT);
-        e.setPadding(dp(10), dp(12), dp(10), dp(12)); return e;
+        e.setInputType(secret
+            ? InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_PASSWORD
+            : InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_URI);
+        return e;
     }
-    private void initRoot(boolean scroll) {
+    private void base(boolean scroll) {
         if (web != null) { web.stopLoading(); web.destroy(); web = null; }
-        root = new LinearLayout(this); root.setOrientation(LinearLayout.VERTICAL); root.setPadding(dp(20), dp(8), dp(20), dp(12));
-        root.setBackgroundColor(Color.WHITE); root.setLayoutDirection(View.LAYOUT_DIRECTION_RTL);
-        if (Build.VERSION.SDK_INT >= 35) root.setOnApplyWindowInsetsListener((v, insets) -> {
-            Insets bars = insets.getInsets(WindowInsets.Type.systemBars());
-            root.setPadding(dp(20), bars.top + dp(8), dp(20), bars.bottom + dp(12));
-            return insets;
-        });
+        root = new LinearLayout(this); root.setOrientation(LinearLayout.VERTICAL);
+        root.setPadding(dp(20), dp(20), dp(20), dp(18));
+        root.setLayoutDirection(View.LAYOUT_DIRECTION_RTL);
+        root.setBackgroundColor(Color.WHITE);
         if (scroll) {
-            ScrollView sc = new ScrollView(this); sc.setFillViewport(true); sc.addView(root); setContentView(sc);
+            ScrollView s = new ScrollView(this); s.setFillViewport(true); s.addView(root); setContentView(s);
         } else setContentView(root);
+        feedback = null;
     }
-    private void title(String text) {
-        TextView t = label(text, 23); t.setTypeface(Typeface.DEFAULT, Typeface.BOLD); root.addView(t);
+    private void heading(String label) {
+        TextView t = text(label, 23); t.setTypeface(Typeface.DEFAULT, Typeface.BOLD); root.addView(t);
     }
-    private void message(String text) { if (notice != null) notice.setText(text); }
-    private void call(String path, JSONObject payload, java.util.function.BiConsumer<Integer, JSONObject> done) {
-        io.execute(() -> {
-            int code = 0; JSONObject result;
-            HttpURLConnection connection = null;
-            try {
-                connection = (HttpURLConnection) new URL(API + path).openConnection();
-                connection.setRequestMethod("POST"); connection.setConnectTimeout(10000); connection.setReadTimeout(10000);
-                connection.setDoOutput(true); connection.setRequestProperty("Content-Type", "application/json; charset=utf-8");
-                connection.setRequestProperty("Accept", "application/json");
-                byte[] bytes = payload.toString().getBytes(StandardCharsets.UTF_8);
-                try (OutputStream out = connection.getOutputStream()) { out.write(bytes); }
-                code = connection.getResponseCode();
-                InputStream stream = code < 400 ? connection.getInputStream() : connection.getErrorStream();
-                try (BufferedReader br = new BufferedReader(new InputStreamReader(stream, StandardCharsets.UTF_8))) {
-                    StringBuilder b = new StringBuilder(); String line;
-                    while ((line = br.readLine()) != null) b.append(line);
-                    result = new JSONObject(b.toString());
-                }
-            } catch (Exception error) {
-                result = new JSONObject();
-                try { result.put("error", "اتصال برقرار نشد. اینترنت یا آدرس سرویس را بررسی کنید."); } catch (Exception ignored) {}
-            } finally { if (connection != null) connection.disconnect(); }
-            final int status = code; final JSONObject data = result;
-            runOnUiThread(() -> { if (!isFinishing() && !isDestroyed()) done.accept(status, data); });
-        });
+    private void note(String value) { if (feedback != null) feedback.setText(value); }
+
+    private byte[] derive(char[] password, byte[] salt) throws Exception {
+        PBEKeySpec spec = new PBEKeySpec(password, salt, ROUNDS, 256);
+        try { return SecretKeyFactory.getInstance("PBKDF2WithHmacSHA256").generateSecret(spec).getEncoded(); }
+        finally { spec.clearPassword(); java.util.Arrays.fill(password, '\0'); }
     }
-    private JSONObject data(String... pairs) {
-        JSONObject obj = new JSONObject();
-        try { for (int i = 0; i < pairs.length; i += 2) obj.put(pairs[i], pairs[i + 1]); } catch (Exception ignored) {}
-        return obj;
+    private String hex(byte[] bytes) {
+        char[] digits = "0123456789abcdef".toCharArray();
+        char[] chars = new char[bytes.length * 2];
+        for (int i = 0; i < bytes.length; i++) {
+            chars[2 * i] = digits[(bytes[i] >>> 4) & 15];
+            chars[2 * i + 1] = digits[bytes[i] & 15];
+        }
+        return new String(chars);
     }
-    private void showLogin() {
-        sessionToken = ""; channel = ""; checking = false;
-        initRoot(true);
-        title("ورود به کانال من");
-        root.addView(label("رمز مشترک برنامه را وارد کنید.", 16));
-        EditText password = field("رمز عبور مشترک", true); root.addView(password);
-        notice = label("", 14); root.addView(notice);
-        Button enter = button("ورود"); root.addView(enter);
-        enter.setOnClickListener(v -> {
-            String entered = password.getText().toString();
-            if (entered.isEmpty()) { message("رمز عبور را وارد کنید."); return; }
-            enter.setEnabled(false); message("در حال بررسی رمز...");
-            call("/login", data("password", entered), (code, result) -> {
-                enter.setEnabled(true); password.setText("");
-                if (code == 200) {
-                    sessionToken = result.optString("token", "");
-                    channel = result.optString("channel", "");
-                    showChannel();
-                } else message(code == 429 ? "تلاش‌های ناموفق زیاد است؛ ۱۵ دقیقه بعد امتحان کنید." : "رمز اشتباه است یا سرویس در دسترس نیست.");
-            });
-        });
-        Button admin = button("تنظیمات مدیر"); root.addView(admin); admin.setOnClickListener(v -> showAdmin());
+    private byte[] fromHex(String s) {
+        if (s.length() % 2 != 0) throw new IllegalArgumentException("bad hex");
+        byte[] out = new byte[s.length() / 2];
+        for (int i = 0; i < out.length; i++) {
+            int a = Character.digit(s.charAt(i * 2), 16);
+            int b = Character.digit(s.charAt(i * 2 + 1), 16);
+            if (a < 0 || b < 0) throw new IllegalArgumentException("bad hex");
+            out[i] = (byte)((a << 4) | b);
+        }
+        return out;
     }
-    private void showAdmin() {
-        initRoot(true);
-        title("تنظیمات مدیر");
-        root.addView(label("کلید محرمانه مدیر را وارد کنید؛ آن را به کاربران ندهید.", 14));
-        EditText adminKey = field("کلید مدیر", true); root.addView(adminKey);
-        EditText newPassword = field("رمز مشترک جدید (حداقل ۱۲ نویسه)", true); root.addView(newPassword);
-        EditText newChannel = field("نام یا لینک عمومی کانال، مثلاً mychannel", false); root.addView(newChannel);
-        notice = label("", 14); root.addView(notice);
-        Button change = button("تغییر رمز همه کاربران"); root.addView(change);
-        change.setOnClickListener(v -> {
-            String pw = newPassword.getText().toString(), key = adminKey.getText().toString();
-            if (pw.length() < 12 || pw.length() > 128) { message("رمز جدید باید بین ۱۲ تا ۱۲۸ نویسه باشد."); return; }
-            if (key.isEmpty()) { message("کلید مدیر را وارد کنید."); return; }
-            change.setEnabled(false); message("در حال ذخیره رمز جدید...");
-            call("/admin/change", data("adminKey", key, "newPassword", pw), (code, result) -> {
-                change.setEnabled(true); newPassword.setText("");
-                if (code == 200) { message("رمز مشترک تغییر کرد. برای ورود مجدد از رمز جدید استفاده کنید."); sessionToken = ""; }
-                else message(code == 429 ? "تلاش‌های زیاد؛ بعداً امتحان کنید." : "تغییر رمز انجام نشد؛ کلید مدیر و اتصال را بررسی کنید.");
-            });
-        });
-        Button saveChannel = button("ثبت / تغییر کانال"); root.addView(saveChannel);
-        saveChannel.setOnClickListener(v -> {
-            String key = adminKey.getText().toString(), ch = newChannel.getText().toString().trim();
-            if (key.isEmpty() || ch.isEmpty()) { message("کلید مدیر و نام کانال را وارد کنید."); return; }
-            saveChannel.setEnabled(false); message("در حال ذخیره کانال...");
-            call("/admin/channel", data("adminKey", key, "channel", ch), (code, result) -> {
-                saveChannel.setEnabled(true);
-                if (code == 200) { channel = result.optString("channel", ""); message("کانال ثبت شد: @" + channel); }
-                else message(code == 422 ? "نام کانال عمومی معتبر نیست." : "ثبت کانال انجام نشد؛ کلید مدیر و اتصال را بررسی کنید.");
-            });
-        });
-        Button back = button("بازگشت"); root.addView(back);
-        back.setOnClickListener(v -> { adminKey.setText(""); showLogin(); });
-    }
-    private boolean isChannelPreview(String value) {
-        if (channel.isEmpty()) return false;
+    private boolean savePassword(String candidate) {
         try {
-            android.net.Uri u = android.net.Uri.parse(value);
-            return "https".equalsIgnoreCase(u.getScheme()) && "t.me".equalsIgnoreCase(u.getHost())
-                && ("/s/" + channel).equalsIgnoreCase(u.getPath());
+            byte[] salt = new byte[16]; random.nextBytes(salt);
+            byte[] hash = derive(candidate.toCharArray(), salt);
+            return prefs.edit().putString(SALT, hex(salt)).putString(HASH, hex(hash)).commit();
         } catch (Exception ex) { return false; }
     }
+    private boolean matches(String candidate) {
+        try {
+            byte[] salt = fromHex(prefs.getString(SALT, ""));
+            byte[] expected = fromHex(prefs.getString(HASH, ""));
+            byte[] actual = derive(candidate.toCharArray(), salt);
+            return expected.length == 32 && MessageDigest.isEqual(expected, actual);
+        } catch (Exception ex) { return false; }
+    }
+    private void showFirstSetup() {
+        unlocked = false; base(true); heading("راه‌اندازی کانال من");
+        root.addView(text("یک رمز برای همین گوشی تعیین کنید. رمز را در جای امن نگه دارید؛ در صورت فراموشی، بازیابی آن در برنامه وجود ندارد.", 16));
+        EditText pass = input("رمز جدید (حداقل ۶ نویسه)", true); root.addView(pass);
+        EditText confirm = input("تکرار رمز", true); root.addView(confirm);
+        feedback = text("", 14); root.addView(feedback);
+        Button setup = button("ثبت رمز و ادامه"); root.addView(setup);
+        setup.setOnClickListener(v -> {
+            String a = pass.getText().toString(), b = confirm.getText().toString();
+            if (a.length() < 6 || a.length() > 128) { note("رمز باید بین ۶ تا ۱۲۸ نویسه باشد."); return; }
+            if (!a.equals(b)) { note("تکرار رمز با رمز اصلی یکسان نیست."); return; }
+            if (!savePassword(a)) { note("ثبت رمز انجام نشد. دوباره امتحان کنید."); return; }
+            pass.setText(""); confirm.setText(""); unlocked = true;
+            showSettings();
+        });
+    }
+    private void showLogin() {
+        unlocked = false; base(true); heading("ورود به کانال من");
+        root.addView(text("رمز تعیین‌شده روی همین گوشی را وارد کنید.", 16));
+        EditText pass = input("رمز عبور", true); root.addView(pass);
+        feedback = text("", 14); root.addView(feedback);
+        Button enter = button("ورود"); root.addView(enter);
+        enter.setOnClickListener(v -> {
+            if (System.currentTimeMillis() < lockedUntil) {
+                note("تلاش‌های ناموفق زیاد است؛ کمی بعد دوباره امتحان کنید."); return;
+            }
+            boolean valid = matches(pass.getText().toString());
+            pass.setText("");
+            if (!valid) {
+                attempts++;
+                if (attempts >= 5) { attempts = 0; lockedUntil = System.currentTimeMillis() + 30000L; }
+                note("رمز اشتباه است."); return;
+            }
+            attempts = 0; unlocked = true; showChannel();
+        });
+    }
+    private String normalizeChannel(String input) {
+        String s = input.trim();
+        Matcher matcher = USERNAME.matcher(s);
+        return matcher.matches() ? matcher.group(1) : "";
+    }
+    private void showSettings() {
+        if (!unlocked) { showLogin(); return; }
+        base(true); heading("تنظیمات برنامه");
+        root.addView(text("نام عمومی کانال را وارد کنید. می‌توانید این قسمت را بعداً تکمیل کنید.", 15));
+        EditText channel = input("mychannel یا https://t.me/mychannel", false);
+        channel.setText(prefs.getString(CHANNEL, "")); root.addView(channel);
+        feedback = text("", 14); root.addView(feedback);
+        Button save = button("ذخیره کانال"); root.addView(save);
+        save.setOnClickListener(v -> {
+            String value = normalizeChannel(channel.getText().toString());
+            if (value.isEmpty()) { note("نام عمومی کانال معتبر نیست. لینک دعوت خصوصی پشتیبانی نمی‌شود."); return; }
+            if (prefs.edit().putString(CHANNEL, value).commit()) { note("کانال ذخیره شد: @" + value); }
+            else note("ذخیره کانال انجام نشد.");
+        });
+        root.addView(text("تغییر رمز فقط روی همین گوشی اعمال می‌شود.", 15));
+        EditText old = input("رمز فعلی", true); root.addView(old);
+        EditText next = input("رمز جدید (حداقل ۶ نویسه)", true); root.addView(next);
+        EditText repeat = input("تکرار رمز جدید", true); root.addView(repeat);
+        Button change = button("تغییر رمز"); root.addView(change);
+        change.setOnClickListener(v -> {
+            String previous = old.getText().toString();
+            String candidate = next.getText().toString();
+            String repeated = repeat.getText().toString();
+            old.setText(""); next.setText(""); repeat.setText("");
+            if (!matches(previous)) { note("رمز فعلی درست نیست."); return; }
+            if (candidate.length() < 6 || candidate.length() > 128 || !candidate.equals(repeated)) {
+                note("رمز جدید باید حداقل ۶ نویسه داشته باشد و تکرار آن یکسان باشد."); return;
+            }
+            if (savePassword(candidate)) { note("رمز این گوشی تغییر کرد."); }
+            else note("تغییر رمز انجام نشد.");
+        });
+        Button view = button("نمایش کانال"); root.addView(view); view.setOnClickListener(v -> showChannel());
+        Button exit = button("قفل کردن برنامه"); root.addView(exit); exit.setOnClickListener(v -> showLogin());
+    }
+    private boolean isSamePreview(Uri u, String username) {
+        return "https".equalsIgnoreCase(u.getScheme())
+            && "t.me".equalsIgnoreCase(u.getHost())
+            && ("/s/" + username).equalsIgnoreCase(u.getPath());
+    }
     private void showChannel() {
-        initRoot(false);
+        if (!unlocked) { showLogin(); return; }
+        String channel = prefs.getString(CHANNEL, "");
         if (channel.isEmpty()) {
-            title("کانال هنوز تنظیم نشده است");
-            root.addView(label("از بخش تنظیمات مدیر، نام عمومی کانال را ثبت کنید.", 16));
-            Button settings = button("تنظیمات مدیر"); root.addView(settings); settings.setOnClickListener(v -> showAdmin());
-            Button refresh = button("بررسی دوباره"); root.addView(refresh); refresh.setOnClickListener(v -> checkSession(true));
-            Button logout = button("خروج"); root.addView(logout); logout.setOnClickListener(v -> showLogin());
+            base(true); heading("کانال هنوز تعیین نشده است");
+            root.addView(text("از تنظیمات، نام عمومی کانال را وارد کنید.", 16));
+            Button settings = button("تنظیمات"); root.addView(settings);
+            settings.setOnClickListener(v -> showSettings());
+            Button exit = button("قفل کردن برنامه"); root.addView(exit);
+            exit.setOnClickListener(v -> showLogin());
             return;
         }
-        TextView heading = label("کانال @" + channel, 18); heading.setTypeface(Typeface.DEFAULT, Typeface.BOLD); root.addView(heading);
-        Button logout = button("خروج از برنامه"); root.addView(logout); logout.setOnClickListener(v -> showLogin());
+        base(false);
+        heading("کانال @" + channel);
+        Button settings = button("تنظیمات"); root.addView(settings);
+        settings.setOnClickListener(v -> showSettings());
+        Button lock = button("قفل کردن برنامه"); root.addView(lock);
+        lock.setOnClickListener(v -> showLogin());
         web = new WebView(this);
-        web.getSettings().setJavaScriptEnabled(true); // Public Telegram preview may need JS for media.
+        web.getSettings().setJavaScriptEnabled(true);  // Telegram public preview media.
         web.getSettings().setDomStorageEnabled(true);
         web.getSettings().setAllowFileAccess(false);
         web.getSettings().setAllowContentAccess(false);
         web.getSettings().setSupportMultipleWindows(false);
         web.setWebViewClient(new WebViewClient() {
-            @Override public boolean shouldOverrideUrlLoading(WebView view, WebResourceRequest request) {
-                return !isChannelPreview(request.getUrl().toString()); // Never open other sites/chats in this app.
+            @Override public boolean shouldOverrideUrlLoading(WebView v, WebResourceRequest req) {
+                return !isSamePreview(req.getUrl(), channel);
             }
-            @Override public boolean shouldOverrideUrlLoading(WebView view, String url) { return !isChannelPreview(url); }
+            @Override public boolean shouldOverrideUrlLoading(WebView v, String url) {
+                return !isSamePreview(Uri.parse(url), channel);
+            }
         });
         root.addView(web, new LinearLayout.LayoutParams(-1, 0, 1));
         web.loadUrl("https://t.me/s/" + channel);
     }
-    private void checkSession(boolean showFeedback) {
-        if (sessionToken.isEmpty() || checking) return;
-        checking = true;
-        call("/session", data("token", sessionToken), (code, result) -> {
-            checking = false;
-            if (code == 401) { showLogin(); return; }
-            if (code == 200) {
-                String fresh = result.optString("channel", "");
-                if (!fresh.equals(channel)) { channel = fresh; showChannel(); }
-                else if (showFeedback) new AlertDialog.Builder(this).setMessage("اطلاعات کانال به‌روز است.").setPositiveButton("باشه", null).show();
-            } else {
-                // Fail closed: do not keep showing the channel while the gate cannot be checked.
-                showLogin();
-                message("دسترسی تأیید نشد. اتصال اینترنت و سرویس را بررسی کنید.");
-            }
-        });
-    }
     @Override public void onBackPressed() {
-        if (!sessionToken.isEmpty()) new AlertDialog.Builder(this).setMessage("از کانال خارج می‌شوید؟").setNegativeButton("انصراف", null).setPositiveButton("خروج", (d, w) -> showLogin()).show();
+        if (unlocked) new AlertDialog.Builder(this).setMessage("برنامه قفل شود؟")
+            .setNegativeButton("انصراف", null)
+            .setPositiveButton("قفل", (d, which) -> showLogin()).show();
         else super.onBackPressed();
+    }
+    @Override protected void onDestroy() {
+        if (web != null) { web.stopLoading(); web.destroy(); web = null; }
+        super.onDestroy();
     }
 }
