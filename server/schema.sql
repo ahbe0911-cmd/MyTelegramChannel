@@ -1,0 +1,12 @@
+CREATE TABLE IF NOT EXISTS config (
+  id INTEGER PRIMARY KEY CHECK (id = 1),
+  salt TEXT NOT NULL,
+  pass_hash TEXT NOT NULL,
+  version INTEGER NOT NULL,
+  channel TEXT NOT NULL DEFAULT ''
+);
+CREATE TABLE IF NOT EXISTS throttle (
+  bucket TEXT PRIMARY KEY,
+  attempts INTEGER NOT NULL,
+  until_ms INTEGER NOT NULL
+);
